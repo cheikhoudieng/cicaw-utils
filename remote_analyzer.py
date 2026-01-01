@@ -5,13 +5,30 @@ import re
 import json
 import math
 import statistics
+import socket
+import webbrowser
+from http.server import SimpleHTTPRequestHandler
+from socketserver import TCPServer
 from collections import defaultdict
 from datetime import datetime
+from threading import Thread
+import time
+
+# Tente de charger dotenv, sinon ignore (pour compatibilité sans .env)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # --- CONFIGURATION ENTERPRISE ---
-PA_HOST = "ssh.pythonanywhere.com"
-PA_USER = "Cicaw"
-PA_PASSWORD = ""  # Remplir ou utiliser des clés SSH
+PA_HOST = os.getenv("PA_HOST", "ssh.pythonanywhere.com")
+PA_USER = os.getenv("PA_USER", "Cicaw")
+PA_PASSWORD = os.getenv("PA_PASSWORD") # Assure-toi que .env est présent ou exporte la variable
+
+if not PA_PASSWORD:
+    # Fallback si pas de .env pour le test
+    PA_PASSWORD = "" 
 
 REMOTE_LOGS = [
     "/home/Cicaw/cicaw_project/persistent_logs/db_traffic_v12.log",
@@ -29,6 +46,8 @@ LOG_PATTERN = re.compile(
     r"(?:\s+\|\s+Mem:\s+(?P<mem>[\d\.]+)\s*MB)?"
 )
 
+OUTPUT_FILENAME = "dashboard_omniview_v7.html"
+
 class EnterpriseMonitor:
     def __init__(self):
         self.stats = {
@@ -43,7 +62,6 @@ class EnterpriseMonitor:
             'hourly': defaultdict(lambda: defaultdict(lambda: {
                 'reqs': 0, 'sql': 0, 'egress_kb': 0
             })),
-            # Stockage des logs bruts par créneau horaire
             'hourly_events': defaultdict(lambda: defaultdict(list)),
             'endpoints': defaultdict(lambda: {
                 'hits': 0, 
@@ -81,7 +99,7 @@ class EnterpriseMonitor:
             sftp.close()
             client.close()
         except Exception as e:
-            print(f"⚠️ Mode Offline (Erreur SSH: {e})")
+            print(f"⚠️ Mode Offline (Erreur SSH ou Pas de password): {e}")
             local_files = [f"logs_buffer/{os.path.basename(p)}" for p in REMOTE_LOGS if os.path.exists(f"logs_buffer/{os.path.basename(p)}")]
         
         return local_files
@@ -109,15 +127,12 @@ class EnterpriseMonitor:
                     
                     row_type = 'CMD' if (is_cmd_file or 'CMD::' in path or duration > 0) else 'WEB'
 
-                    # 1. Overview
                     self.stats['overview']['total_reqs'] += 1
                     self.stats['overview']['total_sql'] += queries
                     self.stats['overview']['total_egress_kb'] += size
                     self.stats['overview']['unique_ips'].add(ip)
-                    if mem > self.stats['overview']['max_ram']:
-                        self.stats['overview']['max_ram'] = mem
+                    if mem > self.stats['overview']['max_ram']: self.stats['overview']['max_ram'] = mem
 
-                    # 2. Daily Stats
                     day = self.stats['daily'][date]
                     day['reqs'] += 1
                     day['sql'] += queries
@@ -125,26 +140,17 @@ class EnterpriseMonitor:
                     day['ips'].add(ip)
                     if duration > 0: day['duration_sum'] += duration
 
-                    # 3. Hourly Stats
                     h_stats = self.stats['hourly'][date][hour]
                     h_stats['reqs'] += 1
                     h_stats['sql'] += queries
                     h_stats['egress_kb'] += size
 
-                    # 4. Hourly Events
-                    # On garde jusqu'à 2500 events par heure pour le détail
                     if len(self.stats['hourly_events'][date][hour]) < 2500:
                          self.stats['hourly_events'][date][hour].append({
-                             'time': time_str,
-                             'ip': ip,
-                             'path': path.replace('CMD::', ''),
-                             'sql': queries,
-                             'dur': duration,
-                             'mem': mem,
-                             'type': row_type
+                             'time': time_str, 'ip': ip, 'path': path.replace('CMD::', ''),
+                             'sql': queries, 'dur': duration, 'mem': mem, 'type': row_type
                          })
 
-                    # 5. Endpoints Stats
                     ep = self.stats['endpoints'][path]
                     ep['type'] = row_type
                     ep['hits'] += 1
@@ -171,80 +177,51 @@ class EnterpriseMonitor:
 
     def generate_recommendations(self, avg_sql, p95_dur, avg_rows, max_mem, total_hits):
         report = []
-        if avg_sql > 50:
-            report.append({ "level": "CRITICAL", "title": "Problème N+1 Critique", "desc": f"Moyenne de {avg_sql:.1f} requêtes SQL.", "action": "Utilisez select_related/prefetch_related." })
-        elif avg_sql > 15:
-            report.append({ "level": "WARNING", "title": "Optimisation SQL nécessaire", "desc": f"{avg_sql:.1f} requêtes par appel.", "action": "Installez Django Debug Toolbar." })
-
-        if p95_dur > 5.0:
-            report.append({ "level": "CRITICAL", "title": "Latence Critique", "desc": f"95% > {p95_dur:.1f}s.", "action": "Déplacez vers Celery ou ajoutez des index DB." })
-        
-        if avg_rows > 2000:
-            report.append({ "level": "CRITICAL", "title": "Volume de données élevé", "desc": f"{avg_rows:.0f} lignes retournées.", "action": "Pagination requise." })
-        
-        if max_mem > 150:
-             report.append({ "level": "WARNING", "title": "Consommation RAM", "desc": f"Pic: {max_mem:.0f} MB.", "action": "Utilisez .iterator()." })
-
-        if not report:
-            report.append({ "level": "SUCCESS", "title": "Endpoint Sain", "desc": "R.A.S.", "action": "Monitoring continu." })
-            
+        if avg_sql > 50: report.append({ "level": "CRITICAL", "title": "Problème N+1 Critique", "desc": f"Moyenne de {avg_sql:.1f} requêtes SQL.", "action": "Utilisez select_related/prefetch_related." })
+        elif avg_sql > 15: report.append({ "level": "WARNING", "title": "Optimisation SQL nécessaire", "desc": f"{avg_sql:.1f} requêtes par appel.", "action": "Installez Django Debug Toolbar." })
+        if p95_dur > 5.0: report.append({ "level": "CRITICAL", "title": "Latence Critique", "desc": f"95% > {p95_dur:.1f}s.", "action": "Déplacez vers Celery ou ajoutez des index DB." })
+        if avg_rows > 2000: report.append({ "level": "CRITICAL", "title": "Volume de données élevé", "desc": f"{avg_rows:.0f} lignes retournées.", "action": "Pagination requise." })
+        if max_mem > 150: report.append({ "level": "WARNING", "title": "Consommation RAM", "desc": f"Pic: {max_mem:.0f} MB.", "action": "Utilisez .iterator()." })
+        if not report: report.append({ "level": "SUCCESS", "title": "Endpoint Sain", "desc": "R.A.S.", "action": "Monitoring continu." })
         return report
 
     def get_peak_hours(self):
-        """Identifie les heures avec le plus de trafic globalement."""
         all_hours = []
         for date, hours_data in self.stats['hourly'].items():
             for hour, data in hours_data.items():
-                all_hours.append({
-                    'date': date,
-                    'hour': hour,
-                    'reqs': data['reqs'],
-                    'sql': data['sql']
-                })
+                all_hours.append({ 'date': date, 'hour': hour, 'reqs': data['reqs'], 'sql': data['sql'] })
         return sorted(all_hours, key=lambda x: x['reqs'], reverse=True)[:4]
 
     def generate_html(self):
         s = self.stats
         dates = sorted(s['daily'].keys())
-        
-        # Données Globales
         global_labels = dates
         global_egress = [round(s['daily'][d]['egress_kb'] / 1024, 2) for d in dates]
         global_sql = [s['daily'][d]['sql'] for d in dates]
 
-        # Données Horaires & Events (Structure JS)
         hourly_db = {}
         hourly_events_db = {} 
-
         for d in dates:
             h_data = s['hourly'][d]
             sorted_hours = sorted(h_data.keys())
-            
-            # Stats pour le graph
             hourly_db[d] = {
                 'labels': [f"{h}h" for h in sorted_hours],
                 'egress': [round(h_data[h]['egress_kb'] / 1024, 2) for h in sorted_hours],
                 'sql': [h_data[h]['sql'] for h in sorted_hours],
                 'raw_hours': sorted_hours
             }
-            
-            # Logs détaillés pour l'inspecteur
             hourly_events_db[d] = {}
             for h in sorted_hours:
                 hourly_events_db[d][h] = s['hourly_events'][d][h]
 
-        # Calcul des endpoints
         endpoints_processed = []
         js_data_map = {}
-
         for path, data in s['endpoints'].items():
             if data['hits'] == 0: continue
-            
             avg_sql = statistics.mean(data['sql'])
             p95_dur = self.calculate_percentile(data['durations'], 95) if data['durations'] else 0
             max_mem = max(data['mems']) if data['mems'] else 0
             avg_rows = statistics.mean(data['rows']) if data['rows'] else 0
-            
             n1_class, n1_risk = "text-slate-500", "LOW"
             if avg_sql > 50: n1_class, n1_risk = "text-red-500 font-bold", "CRITICAL"
             elif avg_sql > 15: n1_class, n1_risk = "text-orange-400 font-bold", "SUSPECT"
@@ -256,16 +233,10 @@ class EnterpriseMonitor:
                 'p95_dur': round(p95_dur, 2), 'avg_rows': round(avg_rows, 1),
                 'n1_risk': n1_risk, 'n1_class': n1_class
             })
-
-            # Historique
             history_data = []
             for d in dates:
                 h = data['history'].get(d, {'hits': 0, 'sql_sum': 0, 'dur_sum': 0})
-                history_data.append({
-                    'date': d, 'hits': h['hits'],
-                    'avg_sql': round(h['sql_sum'] / h['hits'], 1) if h['hits'] else 0,
-                    'avg_dur': round(h['dur_sum'] / h['hits'], 2) if h['hits'] else 0
-                })
+                history_data.append({ 'date': d, 'hits': h['hits'], 'avg_sql': round(h['sql_sum'] / h['hits'], 1) if h['hits'] else 0 })
 
             js_data_map[path] = {
                 'meta': {'hits': data['hits'], 'avg_sql': round(avg_sql, 1), 'p95_dur': round(p95_dur, 2), 'max_mem': round(max_mem, 1), 'avg_rows': round(avg_rows, 0)},
@@ -281,7 +252,7 @@ class EnterpriseMonitor:
         <html lang="fr" class="dark">
         <head>
             <meta charset="UTF-8">
-            <title>Cicaw OmniView v7 • Flags & IPs</title>
+            <title>Cicaw OmniView v8</title>
             <script src="https://cdn.tailwindcss.com"></script>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
@@ -289,26 +260,17 @@ class EnterpriseMonitor:
                 .glass-panel {{ background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.05); }}
                 .clickable-row:hover {{ background-color: rgba(59, 130, 246, 0.1); cursor: pointer; }}
                 .clickable-card:hover {{ transform: translateY(-2px); border-color: rgba(239, 68, 68, 0.5); cursor: pointer; }}
-                
-                /* Modals */
                 .modal-backdrop {{ opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }}
                 .modal-backdrop.show {{ opacity: 1; pointer-events: auto; }}
-                
-                /* Accordion Transitions */
                 .ip-details {{ max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }}
                 .ip-details.open {{ max-height: 1000px; overflow-y: auto; }}
-                
-                /* Flags */
                 .flag-icon {{ font-size: 1.5em; margin-right: 0.5rem; }}
-                
                 ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
                 ::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
                 ::-webkit-scrollbar-track {{ background: #0f172a; }}
             </style>
         </head>
         <body class="text-slate-300 min-h-screen p-4 md:p-8">
-            
-            <!-- MODAL 1: ENDPOINT DETAILS -->
             <div id="detailModal" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
                 <div class="glass-panel w-full max-w-6xl max-h-[95vh] rounded-2xl bg-[#0f172a] border border-slate-700 flex flex-col overflow-hidden">
                     <div class="p-6 border-b border-slate-700/50 flex justify-between bg-slate-900/50">
@@ -333,32 +295,21 @@ class EnterpriseMonitor:
                 </div>
             </div>
 
-            <!-- MODAL 2: SESSION INSPECTOR (V7 with Flags) -->
             <div id="sessionModal" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
                  <div class="glass-panel w-full max-w-6xl max-h-[90vh] rounded-2xl bg-[#0f172a] border border-slate-700 flex flex-col overflow-hidden">
                     <div class="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-900">
-                        <div>
-                            <div class="text-xs font-mono text-purple-400">SESSION INSPECTOR v7</div>
-                            <h2 id="sessionTitle" class="text-xl font-bold text-white">GeoIP Cluster Analysis</h2>
-                        </div>
+                        <div><div class="text-xs font-mono text-purple-400">SESSION INSPECTOR v8</div><h2 id="sessionTitle" class="text-xl font-bold text-white">GeoIP Cluster Analysis</h2></div>
                         <button onclick="closeModal('sessionModal')" class="bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded text-white">Fermer</button>
                     </div>
-                    
-                    <div id="sessionContent" class="flex-grow overflow-y-auto p-4 space-y-2">
-                        <!-- JS WILL INJECT IP GROUPS HERE -->
-                    </div>
-                    
-                    <div class="p-2 bg-slate-900 text-center text-xs text-slate-500 border-t border-slate-800">
-                         Données limitées aux 2500 premiers événements du créneau.
-                    </div>
+                    <div id="sessionContent" class="flex-grow overflow-y-auto p-4 space-y-2"></div>
+                    <div class="p-2 bg-slate-900 text-center text-xs text-slate-500 border-t border-slate-800">Données limitées aux 2500 premiers événements du créneau.</div>
                  </div>
             </div>
 
-            <!-- HEADER -->
             <header class="flex flex-col md:flex-row justify-between items-end mb-8 max-w-[90rem] mx-auto">
                 <div>
-                    <h1 class="text-4xl font-black text-white mb-1">Cicaw<span class="text-blue-500">OmniView</span> <span class="text-sm bg-green-900 text-green-300 px-2 rounded">v7.0 GEO FLAGS</span></h1>
-                    <p class="text-sm text-slate-500">Origine Géographique & Analyse IP</p>
+                    <h1 class="text-4xl font-black text-white mb-1">Cicaw<span class="text-blue-500">OmniView</span> <span class="text-sm bg-green-900 text-green-300 px-2 rounded">v8.0 SERVER</span></h1>
+                    <p class="text-sm text-slate-500">Origine Géographique & Serveur Intégré</p>
                 </div>
                 <div class="text-right">
                     <div class="text-3xl font-bold text-white">{s['overview']['total_reqs']:,}</div>
@@ -367,55 +318,32 @@ class EnterpriseMonitor:
             </header>
 
             <main class="max-w-[90rem] mx-auto space-y-8">
-                
-                <!-- PEAK HOURS -->
                 <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                     {''.join([f'''
                     <div onclick="openSessionModal('{p['date']}', '{p['hour']}')" class="clickable-card transition glass-panel p-4 rounded-xl border-l-4 border-red-500 bg-gradient-to-br from-slate-900 to-slate-800 relative group">
                         <div class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition text-xs text-blue-400">🔍 Inspecter IPs</div>
-                        <div class="flex justify-between items-start mb-2">
-                            <span class="text-xs font-bold text-red-400 uppercase tracking-wider">Peak Traffic</span>
-                            <span class="text-xs text-slate-500">{p['date']}</span>
-                        </div>
+                        <div class="flex justify-between items-start mb-2"><span class="text-xs font-bold text-red-400 uppercase tracking-wider">Peak Traffic</span><span class="text-xs text-slate-500">{p['date']}</span></div>
                         <div class="text-3xl font-bold text-white mb-1">{p['hour']}h <span class="text-lg text-slate-500 font-normal">00</span></div>
-                        <div class="text-sm text-slate-400 flex gap-3">
-                            <span>🔥 {p['reqs']} reqs</span>
-                            <span class="text-blue-400">🗄️ {p['sql']} sql</span>
-                        </div>
+                        <div class="text-sm text-slate-400 flex gap-3"><span>🔥 {p['reqs']} reqs</span><span class="text-blue-400">🗄️ {p['sql']} sql</span></div>
                     </div>
                     ''' for p in peak_hours])}
                 </div>
 
-                <!-- MAIN CHART -->
                 <div class="glass-panel p-6 rounded-xl border-t border-slate-700">
                     <div class="flex justify-between items-center mb-4">
-                        <h3 class="text-sm font-bold text-white flex items-center gap-2">
-                            <span id="chartTitle">Global Load Overview (Daily)</span>
-                            <span class="text-xs text-slate-500 font-normal ml-2 hidden md:inline">(Cliquez pour inspecter les IPs)</span>
-                        </h3>
-                        
+                        <h3 class="text-sm font-bold text-white flex items-center gap-2"><span id="chartTitle">Global Load Overview (Daily)</span></h3>
                         <select id="dateFilter" class="bg-slate-900 border border-slate-700 text-white text-sm rounded px-3 py-1.5 focus:outline-none focus:border-blue-500">
-                            <option value="ALL">🌍 Vue Globale (Tous les jours)</option>
+                            <option value="ALL">🌍 Vue Globale</option>
                             {''.join([f'<option value="{d}">{d}</option>' for d in dates])}
                         </select>
                     </div>
-                    <div class="relative h-64 w-full">
-                        <canvas id="mainChart"></canvas>
-                    </div>
+                    <div class="relative h-64 w-full"><canvas id="mainChart"></canvas></div>
                 </div>
 
-                <!-- ENDPOINTS TABLE -->
                 <div class="glass-panel rounded-xl overflow-hidden border border-slate-700/50">
                     <table class="w-full text-left text-xs">
                         <thead class="bg-slate-800/80 text-slate-400 uppercase font-semibold">
-                            <tr>
-                                <th class="p-4">Path</th>
-                                <th class="p-4 text-center">Risk</th>
-                                <th class="p-4 text-right">Avg SQL</th>
-                                <th class="p-4 text-right">Hits</th>
-                                <th class="p-4 text-right">Data</th>
-                                <th class="p-4 text-right">P95 Time</th>
-                            </tr>
+                            <tr><th class="p-4">Path</th><th class="p-4 text-center">Risk</th><th class="p-4 text-right">Avg SQL</th><th class="p-4 text-right">Hits</th><th class="p-4 text-right">Data</th><th class="p-4 text-right">P95 Time</th></tr>
                         </thead>
                         <tbody class="divide-y divide-slate-700/50">
                             {''.join([f'''
@@ -434,198 +362,86 @@ class EnterpriseMonitor:
             </main>
 
             <script>
-                // DATA INJECTION
                 const ENDPOINT_DB = {json.dumps(js_data_map)};
-                const GLOBAL_DATA = {{
-                    labels: {json.dumps(global_labels)},
-                    egress: {json.dumps(global_egress)},
-                    sql: {json.dumps(global_sql)}
-                }};
+                const GLOBAL_DATA = {{ labels: {json.dumps(global_labels)}, egress: {json.dumps(global_egress)}, sql: {json.dumps(global_sql)} }};
                 const HOURLY_DB = {json.dumps(hourly_db)};
                 const HOURLY_EVENTS = {json.dumps(hourly_events_db)};
 
-                Chart.defaults.color = '#64748b';
-                Chart.defaults.font.family = 'Inter';
-                let mainChartInstance = null;
-                let modalChartInstance = null;
-                let currentViewMode = 'ALL'; 
+                Chart.defaults.color = '#64748b'; Chart.defaults.font.family = 'Inter';
+                let mainChartInstance = null; let modalChartInstance = null; let currentViewMode = 'ALL'; 
 
-                // 1. CHART LOGIC
                 function initMainChart(labels, egressData, sqlData, isHourly) {{
                     const ctx = document.getElementById('mainChart').getContext('2d');
                     if (mainChartInstance) mainChartInstance.destroy();
-
                     mainChartInstance = new Chart(ctx, {{
                         type: 'bar',
                         data: {{
                             labels: labels,
                             datasets: [
-                                {{
-                                    label: 'Egress (MB)',
-                                    data: egressData,
-                                    backgroundColor: '#3b82f6',
-                                    borderRadius: 4,
-                                    yAxisID: 'y'
-                                }},
-                                {{
-                                    label: 'SQL Queries',
-                                    data: sqlData,
-                                    type: 'line',
-                                    borderColor: '#10b981',
-                                    borderWidth: 2,
-                                    tension: 0.4,
-                                    pointRadius: isHourly ? 4 : 2,
-                                    pointHoverRadius: 6,
-                                    yAxisID: 'y1'
-                                }}
+                                {{ label: 'Egress (MB)', data: egressData, backgroundColor: '#3b82f6', borderRadius: 4, yAxisID: 'y' }},
+                                {{ label: 'SQL Queries', data: sqlData, type: 'line', borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: isHourly ? 4 : 2, yAxisID: 'y1' }}
                             ]
                         }},
                         options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
+                            responsive: true, maintainAspectRatio: false,
                             onClick: (e, activeEls) => {{
                                 if(activeEls.length === 0) return;
-                                const idx = activeEls[0].index;
-                                const label = labels[idx];
-
-                                if(currentViewMode === 'ALL') {{
-                                    document.getElementById('dateFilter').value = label;
-                                    applyFilter(label);
-                                }} else {{
-                                    const rawHour = HOURLY_DB[currentViewMode].raw_hours[idx];
-                                    openSessionModal(currentViewMode, rawHour);
-                                }}
+                                const idx = activeEls[0].index; const label = labels[idx];
+                                if(currentViewMode === 'ALL') {{ document.getElementById('dateFilter').value = label; applyFilter(label); }} 
+                                else {{ const rawHour = HOURLY_DB[currentViewMode].raw_hours[idx]; openSessionModal(currentViewMode, rawHour); }}
                             }},
-                            scales: {{
-                                x: {{ grid: {{ display: false }} }},
-                                y: {{ position: 'left', grid: {{ color: '#1e293b' }} }},
-                                y1: {{ position: 'right', grid: {{ display: false }} }}
-                            }}
+                            scales: {{ x: {{ grid: {{ display: false }} }}, y: {{ position: 'left', grid: {{ color: '#1e293b' }} }}, y1: {{ position: 'right', grid: {{ display: false }} }} }}
                         }}
                     }});
                 }}
 
                 function applyFilter(val) {{
-                    const titleEl = document.getElementById('chartTitle');
-                    currentViewMode = val;
-                    if (val === 'ALL') {{
-                        titleEl.innerText = "Global Load Overview (Daily)";
-                        initMainChart(GLOBAL_DATA.labels, GLOBAL_DATA.egress, GLOBAL_DATA.sql, false);
-                    }} else {{
-                        if (HOURLY_DB[val]) {{
-                            titleEl.innerHTML = `Hourly Analysis for <span class="text-blue-400">${{val}}</span>`;
-                            const hData = HOURLY_DB[val];
-                            initMainChart(hData.labels, hData.egress, hData.sql, true);
-                        }}
-                    }}
+                    const titleEl = document.getElementById('chartTitle'); currentViewMode = val;
+                    if (val === 'ALL') {{ titleEl.innerText = "Global Load Overview (Daily)"; initMainChart(GLOBAL_DATA.labels, GLOBAL_DATA.egress, GLOBAL_DATA.sql, false); }} 
+                    else if (HOURLY_DB[val]) {{ titleEl.innerHTML = `Hourly Analysis for <span class="text-blue-400">${{val}}</span>`; const hData = HOURLY_DB[val]; initMainChart(hData.labels, hData.egress, hData.sql, true); }}
                 }}
-
                 document.getElementById('dateFilter').addEventListener('change', (e) => applyFilter(e.target.value));
                 initMainChart(GLOBAL_DATA.labels, GLOBAL_DATA.egress, GLOBAL_DATA.sql, false);
 
-                // --- V7: FLAG RESOLVER ---
                 const FLAG_CACHE = {{}};
-                
                 async function resolveFlag(ip, elementId) {{
-                    if(FLAG_CACHE[ip]) {{
-                        document.getElementById(elementId).innerText = FLAG_CACHE[ip];
-                        return;
-                    }}
-
-                    // 1. HARDCODED KNOWN RANGES (Instant & Free)
-                    // Meta / Facebook
-                    if(ip.startsWith('57.141.') || ip.startsWith('157.240.') || ip.startsWith('66.220.')) {{
-                        updateFlag(ip, elementId, '🇺🇸'); return;
-                    }}
-                    // Google
-                    if(ip.startsWith('66.249.') || ip.startsWith('64.233.')) {{
-                        updateFlag(ip, elementId, '🇺🇸'); return;
-                    }}
-                    // Cloudflare
-                    if(ip.startsWith('172.64.') || ip.startsWith('104.24.')) {{
-                        updateFlag(ip, elementId, '☁️'); return;
-                    }}
-
-                    // 2. API FETCH (Lazy load for unknowns)
-                    // Note: Calls are throttled by browser, using http to avoid mixed content issues if local
+                    if(FLAG_CACHE[ip]) {{ document.getElementById(elementId).innerText = FLAG_CACHE[ip]; return; }}
+                    if(ip.startsWith('57.141.') || ip.startsWith('157.240.') || ip.startsWith('66.220.')) {{ updateFlag(ip, elementId, '🇺🇸'); return; }}
+                    if(ip.startsWith('66.249.') || ip.startsWith('64.233.')) {{ updateFlag(ip, elementId, '🇺🇸'); return; }}
+                    if(ip.startsWith('172.64.') || ip.startsWith('104.24.')) {{ updateFlag(ip, elementId, '☁️'); return; }}
                     try {{
                         const response = await fetch(`http://ip-api.com/json/${{ip}}?fields=countryCode`);
-                        if(response.ok) {{
-                            const data = await response.json();
-                            const flag = getFlagEmoji(data.countryCode);
-                            updateFlag(ip, elementId, flag);
-                        }} else {{
-                            updateFlag(ip, elementId, '🌐');
-                        }}
-                    }} catch(e) {{
-                        // Fallback in case of adblock or offline
-                        updateFlag(ip, elementId, '🌐');
-                    }}
+                        if(response.ok) {{ const data = await response.json(); updateFlag(ip, elementId, getFlagEmoji(data.countryCode)); }} else {{ updateFlag(ip, elementId, '🌐'); }}
+                    }} catch(e) {{ updateFlag(ip, elementId, '🌐'); }}
                 }}
+                function updateFlag(ip, elementId, flag) {{ FLAG_CACHE[ip] = flag; const el = document.getElementById(elementId); if(el) el.innerText = flag; }}
+                function getFlagEmoji(countryCode) {{ if(!countryCode) return '🌐'; const codePoints = countryCode.toUpperCase().split('').map(char =>  127397 + char.charCodeAt()); return String.fromCodePoint(...codePoints); }}
 
-                function updateFlag(ip, elementId, flag) {{
-                    FLAG_CACHE[ip] = flag;
-                    const el = document.getElementById(elementId);
-                    if(el) el.innerText = flag;
-                }}
-
-                function getFlagEmoji(countryCode) {{
-                    if(!countryCode) return '🌐';
-                    const codePoints = countryCode
-                      .toUpperCase()
-                      .split('')
-                      .map(char =>  127397 + char.charCodeAt());
-                    return String.fromCodePoint(...codePoints);
-                }}
-
-                // 2. IP CLUSTERING & MODAL LOGIC
                 function openSessionModal(date, hour) {{
                     const container = document.getElementById('sessionContent');
                     const title = document.getElementById('sessionTitle');
                     container.innerHTML = '';
                     title.innerHTML = `Analyses IP du <span class="text-blue-400">${{date}}</span> à <span class="text-blue-400">${{hour}}h</span>`;
-
                     const events = (HOURLY_EVENTS[date] && HOURLY_EVENTS[date][hour]) ? HOURLY_EVENTS[date][hour] : [];
+                    if (events.length === 0) {{ container.innerHTML = '<div class="p-6 text-center text-slate-500">Aucune donnée.</div>'; document.getElementById('sessionModal').classList.add('show'); return; }}
                     
-                    if (events.length === 0) {{
-                        container.innerHTML = '<div class="p-6 text-center text-slate-500">Aucune donnée pour ce créneau.</div>';
-                        document.getElementById('sessionModal').classList.add('show');
-                        return;
-                    }}
-
-                    // Clustering
                     const ipClusters = {{}};
                     events.forEach(ev => {{
-                        if(!ipClusters[ev.ip]) {{
-                            ipClusters[ev.ip] = {{ count: 0, sql_sum: 0, type: ev.type, paths: new Set(), events: [] }};
-                        }}
-                        const c = ipClusters[ev.ip];
-                        c.count++;
-                        c.sql_sum += ev.sql;
-                        c.paths.add(ev.path);
-                        c.events.push(ev);
+                        if(!ipClusters[ev.ip]) ipClusters[ev.ip] = {{ count: 0, sql_sum: 0, type: ev.type, paths: new Set(), events: [] }};
+                        const c = ipClusters[ev.ip]; c.count++; c.sql_sum += ev.sql; c.paths.add(ev.path); c.events.push(ev);
                     }});
-
                     const sortedIps = Object.keys(ipClusters).sort((a,b) => ipClusters[b].count - ipClusters[a].count);
 
                     sortedIps.forEach((ip, index) => {{
                         const data = ipClusters[ip];
                         const avgSql = (data.sql_sum / data.count).toFixed(1);
-                        const uniquePaths = data.paths.size;
-                        const cardId = 'ip-' + ip.replace(/\./g, '-');
-                        const flagId = 'flag-' + ip.replace(/\./g, '-');
-                        
-                        // Badge logic
+                        const cardId = 'ip-' + ip.replace(/[\.:]/g, '-');
+                        const flagId = 'flag-' + ip.replace(/[\.:]/g, '-');
                         let badgeColor = 'bg-slate-700 text-slate-300';
                         if(ip.startsWith('57.141.') || ip.startsWith('66.220.')) badgeColor = 'bg-blue-600 text-white'; 
-                        if(ip.startsWith('66.249.')) badgeColor = 'bg-green-600 text-white'; 
                         
-                        let borderClass = 'border-slate-700';
-                        if(data.count > 100) borderClass = 'border-red-500/50';
-
                         const html = `
-                        <div class="glass-panel rounded-lg border ${{borderClass}} overflow-hidden mb-2">
-                            <!-- HEADER (Clickable) -->
+                        <div class="glass-panel rounded-lg border border-slate-700 overflow-hidden mb-2">
                             <div onclick="toggleIp('${{cardId}}')" class="p-3 bg-slate-800/80 flex justify-between items-center cursor-pointer hover:bg-slate-800 transition">
                                 <div class="flex items-center gap-3">
                                     <span id="${{flagId}}" class="flag-icon" title="Resolving...">⏳</span>
@@ -635,86 +451,45 @@ class EnterpriseMonitor:
                                 </div>
                                 <div class="flex gap-4 text-sm text-slate-400">
                                     <span>Avg SQL: <span class="${{avgSql > 30 ? 'text-red-400 font-bold' : 'text-blue-300'}}">${{avgSql}}</span></span>
-                                    <span>Paths: ${{uniquePaths}}</span>
-                                    <span class="text-slate-600">▼</span>
+                                    <span>Paths: ${{data.paths.size}}</span>
+                                    <span>▼</span>
                                 </div>
                             </div>
-                            
-                            <!-- DETAILS (Hidden) -->
                             <div id="${{cardId}}" class="ip-details bg-slate-900/50">
                                 <table class="w-full text-left text-xs font-mono">
-                                    <thead class="text-slate-500 border-b border-slate-700">
-                                        <tr>
-                                            <th class="p-2 w-20">Time</th>
-                                            <th class="p-2 w-16 text-right">SQL</th>
-                                            <th class="p-2 w-16 text-right">Dur</th>
-                                            <th class="p-2">Path</th>
-                                        </tr>
-                                    </thead>
+                                    <thead class="text-slate-500 border-b border-slate-700"><tr><th class="p-2 w-20">Time</th><th class="p-2 w-16 text-right">SQL</th><th class="p-2 w-16 text-right">Dur</th><th class="p-2">Path</th></tr></thead>
                                     <tbody class="divide-y divide-slate-800/50 text-slate-300">
-                                        ${{data.events.map(ev => `
-                                            <tr class="hover:bg-slate-800/30">
-                                                <td class="p-2 text-slate-500">${{ev.time}}</td>
-                                                <td class="p-2 text-right ${{ev.sql > 30 ? 'text-red-400' : ''}}">${{ev.sql}}</td>
-                                                <td class="p-2 text-right ${{ev.dur > 1 ? 'text-orange-400' : ''}}">${{ev.dur}}s</td>
-                                                <td class="p-2 truncate max-w-md" title="${{ev.path}}">${{ev.path}}</td>
-                                            </tr>
-                                        `).join('')}}
+                                        ${{data.events.map(ev => `<tr class="hover:bg-slate-800/30"><td class="p-2 text-slate-500">${{ev.time}}</td><td class="p-2 text-right">${{ev.sql}}</td><td class="p-2 text-right">${{ev.dur}}s</td><td class="p-2 truncate max-w-md">${{ev.path}}</td></tr>`).join('')}}
                                     </tbody>
                                 </table>
                             </div>
-                        </div>
-                        `;
+                        </div>`;
                         container.innerHTML += html;
-                        
-                        // Trigger async flag lookup
-                        setTimeout(() => resolveFlag(ip, flagId), index * 50); // Stagger calls slightly
+                        setTimeout(() => resolveFlag(ip, flagId), index * 50);
                     }});
-
                     document.getElementById('sessionModal').classList.add('show');
                 }}
 
                 function toggleIp(id) {{
                     const el = document.getElementById(id);
-                    if(el.style.maxHeight) {{
-                        el.style.maxHeight = null;
-                        el.classList.remove('open');
-                    }} else {{
-                        el.classList.add('open');
-                        el.style.maxHeight = el.scrollHeight + "px";
-                    }}
+                    if(el.style.maxHeight) {{ el.style.maxHeight = null; el.classList.remove('open'); }} 
+                    else {{ el.classList.add('open'); el.style.maxHeight = el.scrollHeight + "px"; }}
                 }}
-
-                // 3. ENDPOINT MODAL
+                
                 function openEndpointModal(path) {{
-                    const data = ENDPOINT_DB[path];
-                    if (!data) return;
+                    const data = ENDPOINT_DB[path]; if (!data) return;
                     document.getElementById('modalTitle').innerText = path;
                     document.getElementById('m_hits').innerText = data.meta.hits;
                     document.getElementById('m_sql').innerText = data.meta.avg_sql;
                     document.getElementById('m_mem').innerText = data.meta.max_mem + ' MB';
                     document.getElementById('m_rows').innerText = data.meta.avg_rows;
-                    
                     const ctx = document.getElementById('modalChart').getContext('2d');
                     if (modalChartInstance) modalChartInstance.destroy();
-                    modalChartInstance = new Chart(ctx, {{
-                        type: 'line',
-                        data: {{
-                            labels: data.history.map(x => x.date),
-                            datasets: [ {{ label: 'Avg SQL', data: data.history.map(x => x.avg_sql), borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true }} ]
-                        }},
-                        options: {{ responsive: true, maintainAspectRatio: false }}
-                    }});
-
-                    const reportContainer = document.getElementById('reportContainer');
-                    reportContainer.innerHTML = '';
-                    data.report.forEach(item => {{
-                         let color = item.level === 'CRITICAL' ? 'border-red-500 bg-red-500/10' : 'border-green-500 bg-green-500/10';
-                         reportContainer.innerHTML += `<div class="p-3 rounded border-l-4 ${{color}} text-sm mb-2"><div class="font-bold text-white">${{item.title}}</div></div>`;
-                    }});
+                    modalChartInstance = new Chart(ctx, {{ type: 'line', data: {{ labels: data.history.map(x => x.date), datasets: [ {{ label: 'Avg SQL', data: data.history.map(x => x.avg_sql), borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true }} ] }}, options: {{ responsive: true, maintainAspectRatio: false }} }});
+                    const reportContainer = document.getElementById('reportContainer'); reportContainer.innerHTML = '';
+                    data.report.forEach(item => {{ let color = item.level === 'CRITICAL' ? 'border-red-500 bg-red-500/10' : 'border-green-500 bg-green-500/10'; reportContainer.innerHTML += `<div class="p-3 rounded border-l-4 ${{color}} text-sm mb-2"><div class="font-bold text-white">${{item.title}}</div></div>`; }});
                     document.getElementById('detailModal').classList.add('show');
                 }}
-
                 function closeModal(id) {{ document.getElementById(id).classList.remove('show'); }}
                 window.onclick = function(event) {{ if (event.target.classList.contains('modal-backdrop')) {{ event.target.classList.remove('show'); }} }}
             </script>
@@ -722,10 +497,57 @@ class EnterpriseMonitor:
         </html>
         """
         
-        output_file = "dashboard_omniview_v7.html"
-        with open(output_file, "w", encoding="utf-8") as f:
+        with open(OUTPUT_FILENAME, "w", encoding="utf-8") as f:
             f.write(html_content)
-        print(f"\n🚀 Dashboard V7 déployé : {os.path.abspath(output_file)}")
+        print(f"\n🚀 Fichier généré : {os.path.abspath(OUTPUT_FILENAME)}")
+
+# --- SERVER UTILS ---
+class CustomHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        # Redirige toutes les requêtes racine vers le fichier Dashboard
+        if self.path == '/':
+            self.path = OUTPUT_FILENAME
+        # CORRECTION : On appelle super().do_GET() SANS arguments
+        return super().do_GET()
+
+    def log_message(self, format, *args):
+        # Silencieux pour ne pas polluer la console
+        pass
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def start_server_and_open():
+    # Chercher un port libre (commencer par 8000)
+    port = 8000
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                break
+        except OSError:
+            port += 1
+    
+    # URL locale
+    url = f"http://localhost:{port}"
+    print(f"\n🌐 SERVEUR WEB LANCÉ !")
+    print(f"👉 Accédez à votre Dashboard ici : \033[94m{url}\033[0m")
+    print(f"   (Appuyez sur CTRL+C pour arrêter le serveur)")
+
+    # Ouvrir le navigateur automatiquement
+    try:
+        webbrowser.open(url)
+    except:
+        pass
+
+    # Lancer le serveur
+    with TCPServer(("", port), CustomHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n🛑 Serveur arrêté.")
 
 if __name__ == "__main__":
     monitor = EnterpriseMonitor()
@@ -733,5 +555,8 @@ if __name__ == "__main__":
     if files:
         monitor.parse_logs(files)
         monitor.generate_html()
+        
+        # --- LANCEMENT SERVEUR AUTOMATIQUE ---
+        start_server_and_open()
     else:
         print("❌ Aucune donnée de logs disponible.")
