@@ -1,0 +1,5 @@
+*.html
+
+*.env
+
+venv
