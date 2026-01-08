@@ -29,7 +29,7 @@ PA_USER = os.getenv("PA_USER", "Cicaw")
 PA_PASSWORD = os.getenv("PA_PASSWORD", "") 
 
 REMOTE_LOGS = [
-    "/home/Cicaw/cicaw_project/persistent_logs/db_traffic_v15.log",
+    "/home/Cicaw/cicaw_project/persistent_logs/db_traffic_v17.log",
     "/home/Cicaw/cicaw_project/persistent_logs/cmd_traffic_v2.log"
 ]
 
