@@ -1,465 +1,243 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import streamlit as st
+import pandas as pd
 import paramiko
 import os
 import re
-import json
-import math
-import statistics
-import socket
-import webbrowser
-from http.server import SimpleHTTPRequestHandler
-from socketserver import TCPServer
-from collections import defaultdict
-from threading import Thread
-import time
+import numpy as np
+import plotly.express as px
+from datetime import datetime
+from dotenv import load_dotenv
+from sklearn.linear_model import LinearRegression
 
-# --- MODULE IA (Gestion d'erreur si non installé) ---
+# --- CONFIGURATION ---
+st.set_page_config(page_title="OmniView v3 - Full Metrics", layout="wide", page_icon="🧠")
+
 try:
-    from sklearn.linear_model import LinearRegression
-    import numpy as np
+    load_dotenv()
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-    print("⚠️ Scikit-Learn/Numpy non trouvés. Le module de prédiction IA sera désactivé.")
-    print("👉 Installez-les via: pip install scikit-learn numpy")
 
-# --- CONFIGURATION ---
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
+# Variables d'environnement
 PA_HOST = os.getenv("PA_HOST", "ssh.pythonanywhere.com")
 PA_USER = os.getenv("PA_USER", "Cicaw")
 PA_PASSWORD = os.getenv("PA_PASSWORD", "") 
 
+# Liste des fichiers à analyser
 REMOTE_LOGS = [
-    "/home/Cicaw/cicaw_project/persistent_logs/db_traffic_v17.log",
+    "/home/Cicaw/cicaw_project/persistent_logs/db_traffic_v18.log",
+    # "/home/Cicaw/cicaw_project/persistent_logs/cmd_traffic_v3.log"
 ]
 
-# --- REGEX AJUSTÉE POUR TES LOGS ---
-# Match: INFO 2025-12-29 04:15:05,696 middleware IP: ...
-LOG_PATTERN = re.compile(
-    r"^INFO\s+(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}),\d+\s+middleware\s+"
-    r"IP:\s+(?P<ip>[\d\.]+)\s+\|\s+"
-    r"Path:\s+(?P<path>.*?)\s+\|\s+"
-    r"Queries:\s+(?P<queries>\d+)\s+\|\s+"
-    r"Rows:\s+(?P<rows>\d+)\s+\|\s+"
-    r"Est\. Size:\s+(?P<size>[\d\.]+)\s+KB"
-)
+# --- 1. MOTEUR DE PARSING ROBUSTE ---
 
-OUTPUT_FILENAME = "dashboard_omniview_v2_1.html"
-LOCAL_LOG_DIR = "logs_buffer"
-
-class EnterpriseMonitor:
-    def __init__(self):
-        self.stats = {
-            'overview': {
-                'total_reqs': 0, 'total_sql': 0, 'total_egress_kb': 0,
-                'unique_ips': set()
-            },
-            'daily': defaultdict(lambda: {
-                'reqs': 0, 'sql': 0, 'egress_kb': 0, 
-                'ips': set()
-            }),
-            'hourly': defaultdict(lambda: defaultdict(lambda: {
-                'reqs': 0, 'sql': 0, 'egress_kb': 0
-            })),
-            'endpoints': defaultdict(lambda: {
-                'hits': 0, 
-                'sql': [], 
-                'rows': [], 
-                'size_kb': []
-            })
-        }
-
-    def fetch_logs(self):
-        local_files = []
-        if not os.path.exists(LOCAL_LOG_DIR):
-            os.makedirs(LOCAL_LOG_DIR)
-
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            print(f"🔄 Connexion SSH à {PA_HOST}...")
-            
-            connect_kwargs = {"hostname": PA_HOST, "username": PA_USER, "timeout": 10}
-            if PA_PASSWORD:
-                connect_kwargs["password"] = PA_PASSWORD
-            
-            client.connect(**connect_kwargs)
-            sftp = client.open_sftp()
-            
-            for remote in REMOTE_LOGS:
-                local_name = os.path.join(LOCAL_LOG_DIR, os.path.basename(remote))
-                try:
-                    sftp.get(remote, local_name)
-                    local_files.append(local_name)
-                    print(f"✅ Téléchargé : {remote}")
-                except Exception as e:
-                    print(f"⚠️ Erreur fichier {remote}: {e}")
-            
-            sftp.close()
-            client.close()
-        except Exception as e:
-            print(f"⚠️ Mode Offline (Erreur SSH): {e}")
-            for remote in REMOTE_LOGS:
-                local_name = os.path.join(LOCAL_LOG_DIR, os.path.basename(remote))
-                if os.path.exists(local_name):
-                    local_files.append(local_name)
-        
-        return local_files
-
-    def clean_path(self, path):
-        """
-        ROBUSTESSE : Regroupe les URLs similaires.
-        Ex: /details/3598/produit-xyz -> /details/{id}/produit-xyz
-        """
-        path = path.strip()
-        
-        # Ignorer les assets statiques et fichiers well-known pour ne pas polluer
-        if path.startswith('/.well-known'): return "System: Well-Known"
-        
-        # Remplacement UUID
-        path = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '{uuid}', path)
-        
-        # Remplacement ID numérique spécifique à ton URL structure (/details/1234/...)
-        path = re.sub(r'/details/\d+/', '/details/{id}/', path)
-        path = re.sub(r'/api/products/\d+/', '/api/products/{id}/', path)
-        
-        # Remplacement générique ID en fin d'URL
-        path = re.sub(r'/\d+$', '/{id}', path)
-        
-        if '?' in path:
-            path = path.split('?')[0]
-            
-        return path
-
-    def parse_logs(self, files):
-        print("📊 Analyse et Clustering des données...")
-        for file_path in files:
-            if "cmd" in os.path.basename(file_path).lower():
-                continue
-
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        match = LOG_PATTERN.search(line)
-                        if not match: continue
-
-                        d = match.groupdict()
-                        path_raw = d['path'].strip()
-
-                        queries = int(d['queries'])
-                        rows = int(d['rows'])
-                        size = float(d['size'])
-                        date = d['date']
-                        time_str = d['time']
-                        hour = time_str.split(':')[0] 
-                        ip = d['ip']
-
-                        clean_path = self.clean_path(path_raw)
-
-                        # Overview
-                        self.stats['overview']['total_reqs'] += 1
-                        self.stats['overview']['total_sql'] += queries
-                        self.stats['overview']['total_egress_kb'] += size
-                        self.stats['overview']['unique_ips'].add(ip)
-
-                        # Daily
-                        day = self.stats['daily'][date]
-                        day['reqs'] += 1
-                        day['sql'] += queries
-                        day['egress_kb'] += size
-                        day['ips'].add(ip)
-
-                        # Hourly Stats
-                        h_stats = self.stats['hourly'][date][hour]
-                        h_stats['reqs'] += 1
-                        h_stats['sql'] += queries
-                        h_stats['egress_kb'] += size
-
-                        # Endpoints Aggregation
-                        ep = self.stats['endpoints'][clean_path]
-                        ep['hits'] += 1
-                        ep['sql'].append(queries)
-                        # On limite le stockage pour la RAM
-                        if len(ep['rows']) < 5000: 
-                            ep['rows'].append(rows)
-                            ep['size_kb'].append(size)
-
-            except Exception as e:
-                print(f"❌ Erreur lecture fichier {file_path}: {e}")
-
-    def predict_sql_load(self, target_visitors=1000):
-        if not HAS_SKLEARN: return None
-        X_train, y_train = [], []
-
-        for date, hours in self.stats['hourly'].items():
-            for hour, data in hours.items():
-                if data['reqs'] > 5: # Filtre bruit
-                    X_train.append(data['reqs'])
-                    y_train.append(data['sql'])
-
-        if len(X_train) < 5:
-            return {"error": "Pas assez de données (< 5 heures)"}
-
-        try:
-            X = np.array(X_train).reshape(-1, 1)
-            y = np.array(y_train)
-            model = LinearRegression()
-            model.fit(X, y)
-            
-            predicted_sql = model.predict([[target_visitors]])[0]
-            r2_score = model.score(X, y) * 100
-            
-            return {
-                "target": target_visitors,
-                "prediction": int(predicted_sql) if predicted_sql > 0 else 0,
-                "cost_per_req": round(model.coef_[0], 2),
-                "confidence": round(r2_score, 1)
-            }
-        except Exception as e:
-            return {"error": f"Erreur math: {e}"}
-
-    def generate_html(self):
-        s = self.stats
-        dates = sorted(s['daily'].keys())
-        global_labels = dates
-        global_sql = [s['daily'][d]['sql'] for d in dates]
-        global_reqs = [s['daily'][d]['reqs'] for d in dates]
-
-        ai_data = self.predict_sql_load(1000)
-
-        endpoints_table_data = []
-        for path, data in s['endpoints'].items():
-            if data['hits'] == 0: continue
-            
-            avg_sql = statistics.mean(data['sql']) if data['sql'] else 0
-            avg_rows = statistics.mean(data['rows']) if data['rows'] else 0
-            total_egress_mb = sum(data['size_kb']) / 1024 if data['size_kb'] else 0
-            
-            risk_score = 0
-            if avg_sql > 50: risk_score += 3
-            elif avg_sql > 15: risk_score += 1
-            if avg_rows > 100: risk_score += 1 # Remplacé Duration par Rows car Duration indisponible
-
-            endpoints_table_data.append({
-                'path': path,
-                'hits': data['hits'],
-                'avg_sql': round(avg_sql, 1),
-                'avg_rows': round(avg_rows, 0),
-                'egress_mb': round(total_egress_mb, 2),
-                'risk': risk_score
-            })
-
-        endpoints_table_data.sort(key=lambda x: x['avg_sql'] * x['hits'], reverse=True)
-        endpoints_table_data = endpoints_table_data[:300]
-
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="fr" class="dark">
-        <head>
-            <meta charset="UTF-8">
-            <title>OmniView v2.1 - SQL Analytics</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <style>
-                body {{ background-color: #0f172a; font-family: system-ui, sans-serif; color: #cbd5e1; }}
-                .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; }}
-                .metric-label {{ font-size: 0.75rem; text-transform: uppercase; color: #64748b; }}
-                .metric-val {{ font-size: 1.5rem; font-weight: 700; color: #f1f5f9; }}
-                .table-th {{ text-align: left; padding: 0.75rem; font-size: 0.75rem; color: #94a3b8; border-bottom: 1px solid #334155; }}
-                .table-td {{ padding: 0.75rem; border-bottom: 1px solid #1e293b; font-family: monospace; font-size: 0.85rem; }}
-                tr:hover td {{ background-color: #334155; }}
-            </style>
-        </head>
-        <body class="p-6 max-w-7xl mx-auto space-y-6">
-            
-            <div class="flex justify-between items-center">
-                <h1 class="text-3xl font-bold text-white">Cicaw <span class="text-blue-500">OmniView</span> v2.1</h1>
-                <span class="text-xs bg-slate-700 text-slate-300 px-2 rounded">Log Format: Custom (No Duration)</span>
-            </div>
-
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div class="card p-4">
-                    <div class="metric-label">Total Requêtes</div>
-                    <div class="metric-val">{s['overview']['total_reqs']:,}</div>
-                </div>
-                <div class="card p-4">
-                    <div class="metric-label">Total SQL Queries</div>
-                    <div class="metric-val text-blue-400">{s['overview']['total_sql']:,}</div>
-                </div>
-                <div class="card p-4">
-                    <div class="metric-label">Bandwidth (KB)</div>
-                    <div class="metric-val text-purple-400">{int(s['overview']['total_egress_kb']):,}</div>
-                </div>
-                <div class="card p-4">
-                    <div class="metric-label">Unique IPs</div>
-                    <div class="metric-val text-yellow-400">{len(s['overview']['unique_ips'])}</div>
-                </div>
-            </div>
-
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <div class="card p-6 lg:col-span-2">
-                    <h3 class="font-bold text-white mb-4">Activité SQL Quotidienne</h3>
-                    <div class="h-64"><canvas id="mainChart"></canvas></div>
-                </div>
-
-                <div class="card p-6 border-l-4 border-blue-500 bg-slate-800/50">
-                    <h3 class="font-bold text-white mb-2">🔮 Prédiction Charge (IA)</h3>
-                    {self._render_prediction_html(ai_data)}
-                </div>
-            </div>
-
-            <div class="card overflow-hidden">
-                <div class="p-4 bg-slate-800/50 border-b border-slate-700">
-                    <h3 class="font-bold text-white">Top Endpoints (Par impact SQL)</h3>
-                </div>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left border-collapse">
-                        <thead>
-                            <tr>
-                                <th class="table-th">Path (Clustered)</th>
-                                <th class="table-th text-right">Avg SQL</th>
-                                <th class="table-th text-right">Avg Rows</th>
-                                <th class="table-th text-right">Hits</th>
-                                <th class="table-th text-center">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody class="text-slate-300">
-                            {''.join([self._render_row(row) for row in endpoints_table_data])}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <script>
-                const ctx = document.getElementById('mainChart').getContext('2d');
-                new Chart(ctx, {{
-                    type: 'line',
-                    data: {{
-                        labels: {json.dumps(global_labels)},
-                        datasets: [
-                            {{
-                                label: 'Requêtes Web',
-                                data: {json.dumps(global_reqs)},
-                                borderColor: '#3b82f6',
-                                backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                                fill: true,
-                                tension: 0.4,
-                                yAxisID: 'y'
-                            }},
-                            {{
-                                label: 'Requêtes SQL',
-                                data: {json.dumps(global_sql)},
-                                borderColor: '#10b981',
-                                borderDash: [5, 5],
-                                tension: 0.4,
-                                yAxisID: 'y1'
-                            }}
-                        ]
-                    }},
-                    options: {{
-                        responsive: true, maintainAspectRatio: false,
-                        interaction: {{ mode: 'index', intersect: false }},
-                        scales: {{
-                            y: {{ position: 'left', grid: {{ color: '#334155' }} }},
-                            y1: {{ position: 'right', grid: {{ display: false }} }}
-                        }}
-                    }}
-                }});
-            </script>
-        </body>
-        </html>
-        """
-        
-        with open(OUTPUT_FILENAME, "w", encoding="utf-8") as f:
-            f.write(html_content)
-        print(f"\n🚀 Dashboard généré : {os.path.abspath(OUTPUT_FILENAME)}")
-
-    def _render_prediction_html(self, data):
-        if not data: return '<p class="text-slate-500">IA inactive.</p>'
-        if "error" in data: return f'<p class="text-red-400 text-sm">{data["error"]}</p>'
-        
-        return f"""
-        <div class="space-y-4 mt-4">
-            <div>
-                <div class="text-xs text-slate-400">Simulation pour</div>
-                <div class="text-2xl font-bold text-white">{data['target']:,} <span class="text-sm font-normal">visiteurs</span></div>
-            </div>
-            <div class="p-3 bg-slate-900 rounded border border-slate-700">
-                <div class="text-xs text-slate-400">Charge SQL Estimée</div>
-                <div class="text-xl font-bold text-blue-400">{data['prediction']:,} queries</div>
-            </div>
-            <div class="flex justify-between text-sm">
-                <span class="text-slate-400">Coût SQL/Visite :</span>
-                <span class="font-mono text-white font-bold">{data['cost_per_req']}</span>
-            </div>
-            <div class="flex justify-between text-sm">
-                <span class="text-slate-400">Fiabilité Modèle :</span>
-                <span class="font-bold { 'text-green-400' if data['confidence'] > 70 else 'text-orange-400' }">{data['confidence']}%</span>
-            </div>
-        </div>
-        """
-
-    def _render_row(self, row):
-        sql_color = "text-slate-400"
-        if row['avg_sql'] > 50: sql_color = "text-red-500 font-bold"
-        elif row['avg_sql'] > 15: sql_color = "text-orange-400"
-
-        badge = '<span class="px-2 py-0.5 rounded bg-green-900 text-green-300 text-[10px]">OK</span>'
-        if row['risk'] >= 3: badge = '<span class="px-2 py-0.5 rounded bg-red-900 text-red-300 text-[10px]">LOURD</span>'
-        elif row['risk'] >= 1: badge = '<span class="px-2 py-0.5 rounded bg-orange-900 text-orange-300 text-[10px]">MODÉRÉ</span>'
-
-        return f"""
-        <tr class="transition border-b border-slate-800/50">
-            <td class="table-td text-white truncate max-w-[250px]" title="{row['path']}">{row['path']}</td>
-            <td class="table-td text-right {sql_color}">{row['avg_sql']}</td>
-            <td class="table-td text-right text-slate-500">{row['avg_rows']}</td>
-            <td class="table-td text-right text-slate-500">{row['hits']}</td>
-            <td class="table-td text-center">{badge}</td>
-        </tr>
-        """
-
-# --- SERVEUR WEB ---
-class CustomHandler(SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/': self.path = OUTPUT_FILENAME
-        return super().do_GET()
-    def log_message(self, format, *args): pass
-
-def start_server():
-    port = 8000
-    while True:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('', port))
-                break 
-        except OSError: port += 1
+def parse_log_line(line):
+    """
+    Parse une ligne du nouveau middleware format Pipe (|).
+    """
+    data = {}
     
-    url = f"http://localhost:{port}"
-    print(f"\n🌐 Dashboard prêt : \033[94m{url}\033[0m")
-    
-    def open_browser():
-        time.sleep(1)
-        webbrowser.open(url)
-    Thread(target=open_browser).start()
-
-    with TCPServer(("", port), CustomHandler) as httpd:
-        try: httpd.serve_forever()
-        except KeyboardInterrupt: print("\n🛑 Arrêt.")
-
-if __name__ == "__main__":
-    monitor = EnterpriseMonitor()
-    files = monitor.fetch_logs()
-    
-    if files:
-        monitor.parse_logs(files)
-        monitor.generate_html()
-        start_server()
+    # 1. Extraction Timestamp
+    ts_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+    if ts_match:
+        data['timestamp'] = datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
     else:
-        print("❌ Echec : Aucun log disponible.")
+        return None
+
+    # 2. Découpage par Pipe '|'
+    parts = line.split('|')
+    
+    for p in parts:
+        p = p.strip() # Nettoyage des espaces
+        try:
+            # Parsing plus souple
+            if "IP:" in p: 
+                data['ip'] = p.split('IP:')[1].strip()
+            elif "Path:" in p: 
+                data['raw_path'] = p.split('Path:')[1].strip()
+            
+            # Métriques numériques
+            elif "CPU:" in p: 
+                data['cpu_ms'] = float(re.findall(r"[\d\.]+", p)[0])
+            elif "RAM Peak:" in p: 
+                data['ram_peak_kb'] = float(re.findall(r"[\d\.]+", p)[0])
+            elif "DB Q:" in p or "Queries:" in p: 
+                data['queries'] = int(re.findall(r"\d+", p)[0])
+            elif "Rows:" in p: 
+                data['rows'] = int(re.findall(r"\d+", p)[0])
+        except Exception:
+            continue 
+
+    if 'raw_path' in data:
+        return data
+    return None
+
+def clean_path_logic(path):
+    """Regroupe les URLs."""
+    if not path: return "Unknown"
+    if "CMD::" in path: return path 
+    path = path.split('?')[0]
+    path = re.sub(r'[0-9a-fA-F-]{36}', '{uuid}', path)
+    path = re.sub(r'/\d+/', '/{id}/', path)
+    path = re.sub(r'/\d+$', '/{id}', path)
+    return path
+
+@st.cache_data(ttl=300)
+def fetch_and_process_data():
+    """Récupère via SSH et transforme en DataFrame."""
+    logs_data = []
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_kwargs = {"hostname": PA_HOST, "username": PA_USER, "timeout": 10}
+        if PA_PASSWORD: connect_kwargs["password"] = PA_PASSWORD
+        
+        ssh.connect(**connect_kwargs)
+        sftp = ssh.open_sftp()
+        
+        raw_content = ""
+        for log_path in REMOTE_LOGS:
+            try:
+                with sftp.open(log_path, 'r') as f:
+                    raw_content += f.read().decode('utf-8')
+            except Exception: pass
+            
+        sftp.close()
+        ssh.close()
+        
+    except Exception as e:
+        st.error(f"Erreur SSH: {e}")
+        return pd.DataFrame()
+
+    for line in raw_content.split('\n'):
+        parsed = parse_log_line(line)
+        if parsed:
+            parsed['path_group'] = clean_path_logic(parsed.get('raw_path', ''))
+            logs_data.append(parsed)
+            
+    df = pd.DataFrame(logs_data)
+    
+    if df.empty:
+        return df
+
+    # --- CORRECTION DU BUG "Column not found" ---
+    # On s'assure que toutes les colonnes nécessaires existent
+    required_cols = {
+        'ip': 'Server',         # Valeur par défaut si IP manquante
+        'cpu_ms': 0.0,
+        'ram_peak_kb': 0.0,
+        'queries': 0,
+        'rows': 0
+    }
+    
+    for col, default_val in required_cols.items():
+        if col not in df.columns:
+            df[col] = default_val
+        else:
+            df[col] = df[col].fillna(default_val)
+            
+    return df
+
+# --- 2. IA ENGINE ---
+
+def run_simulation(df, visitors_per_hour):
+    if df.empty: return None
+
+    # Agrégation par heure
+    df['date_hour'] = df['timestamp'].dt.floor('h')
+    training_data = df.groupby('date_hour').agg({
+        'path_group': 'count', 
+        'queries': 'sum',       
+        'cpu_ms': 'sum'
+    }).rename(columns={'path_group': 'hits'})
+
+    training_data = training_data[training_data['hits'] > 5]
+    if len(training_data) < 3: return "NOT_ENOUGH_DATA"
+
+    X = training_data[['hits']].values
+    
+    model_sql = LinearRegression().fit(X, training_data['queries'])
+    pred_sql = model_sql.predict([[visitors_per_hour]])[0]
+    
+    model_cpu = LinearRegression().fit(X, training_data['cpu_ms'])
+    pred_cpu = model_cpu.predict([[visitors_per_hour]])[0]
+
+    return {
+        'sql': max(0, int(pred_sql)),
+        'cpu_sec': max(0, int(pred_cpu / 1000)),
+        'sql_coef': model_sql.coef_[0]
+    }
+
+# --- 3. DASHBOARD UI ---
+
+st.title("🧠 OmniView v3")
+st.caption(f"Monitoring Intelligent (CPU • RAM • SQL) | Connecté à: {PA_HOST}")
+
+with st.spinner('Téléchargement et analyse des logs...'):
+    df = fetch_and_process_data()
+
+if df.empty:
+    st.warning("Aucune donnée disponible. Vérifiez les chemins des logs.")
+    st.stop()
+
+# KPI
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Traffic Analysé", f"{len(df)} reqs")
+col2.metric("Temps CPU Moyen", f"{df['cpu_ms'].mean():.1f} ms")
+col3.metric("RAM Peak Max", f"{(df['ram_peak_kb'].max() / 1024):.1f} MB")
+col4.metric("Total SQL Queries", f"{df['queries'].sum():,}")
+
+st.divider()
+
+# SIMULATEUR
+st.subheader("🔮 Prédiction de Charge (IA)")
+col_sim_ctrl, col_sim_res = st.columns([1, 2])
+
+with col_sim_ctrl:
+    visitors = st.slider("Visiteurs / Heure", 100, 20000, 1000, step=500)
+    sim_results = run_simulation(df, visitors)
+
+with col_sim_res:
+    if sim_results == "NOT_ENOUGH_DATA":
+        st.info("Pas assez de données pour l'IA.")
+    elif sim_results:
+        c1, c2 = st.columns(2)
+        c1.info(f"💾 **DB Load:** {sim_results['sql']:,} queries")
+        c2.warning(f"⚡ **CPU Time:** {sim_results['cpu_sec']} sec/h")
+
+st.divider()
+
+# GRAPHIQUES
+tab1, tab2 = st.tabs(["📊 Scatter Plot", "📋 Top Endpoints"])
+
+with tab1:
+    st.markdown("#### Corrélation: CPU vs Mémoire")
+    # Le bug était ici : on utilise désormais des colonnes garanties d'exister
+    fig = px.scatter(
+        df, 
+        x="cpu_ms", 
+        y="ram_peak_kb", 
+        size="queries", 
+        color="queries",
+        hover_data=["raw_path", "ip"], # Maintenant 'ip' existe forcément
+        color_continuous_scale="Bluered"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    stats = df.groupby('path_group').agg({
+        'queries': 'mean',
+        'cpu_ms': 'mean',
+        'ram_peak_kb': 'max',
+        'path_group': 'count'
+    }).rename(columns={'path_group': 'hits'})
+    
+    stats['impact'] = (stats['queries'] * stats['hits']) 
+    stats = stats.sort_values('impact', ascending=False).head(50).reset_index()
+    
+    st.dataframe(stats, use_container_width=True, height=600)
+
+if st.button("🔄 Rafraîchir"):
+    st.cache_data.clear()
+    st.rerun()
